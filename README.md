@@ -41,6 +41,7 @@ python -m pytest tests/ -q
 | `POST` | `/erasure` | 提交清除请求 `{"user_id": "..."}`（幂等，重复提交返回同一任务） |
 | `GET` | `/erasure/{task_id}` | 查询清除进度 |
 | `GET` | `/erasure?user_id=...` | 列出清除任务 |
+| `GET` | `/changes` | 日期变更流：首次取日期快照与游标，此后按游标分页领取通知 |
 | `GET` | `/health` | 健康检查 |
 
 ### 上传 CSV 格式
@@ -86,6 +87,38 @@ curl http://localhost:8000/erasure/<task_id>
 - **幂等与永久拦截**：每个用户终生对应同一任务（`user_id` 唯一约束），重复提交返回同一
   任务；任务行永不删除，因此完成后该用户被永久拦截。
 
+## 日期变更流（下游镜像）
+
+下游报表程序据此维护按日点击文件的本地镜像。一个端点完成"首次取数 + 增量领取"：
+
+```bash
+# 1) 首次取数：当前可下载的日期 + 游标
+curl 'http://localhost:8000/changes'
+# {"dates":[{"date":"2026-11-01","files":2,"rows":3}],"cursor":12}
+
+# 2) 凭游标分页领取通知
+curl 'http://localhost:8000/changes?since=12&limit=100'
+# {"events":[{"seq":13,"date":"2026-11-01","action":"refetch","created_at":"..."}],
+#  "cursor":13,"latest_cursor":13,"has_more":false}
+```
+
+`action` 语义：
+
+- `refetch`：该日内容已就绪/已更新，下游应重新下载该日文件（`GET /dates/{date}/download`）。
+- `withdraw`：清除请求受理，该日暂时撤下；下游应停止提供该日旧副本。
+- `delete`：清除完成后该日已无文件，下游应删除本地旧副本。
+
+保证：
+
+- **固定编号**：`seq` 自增且永不复用，事件只追加不修改；持久化 `cursor` 后进程重启可继续领取。
+- **无断档**：首次快照（日期列表 + 游标）与上传/清除提交在同一把提交锁下完成。任一提交要么
+  完整落在快照之前（出现在 `dates` 中），要么落在之后（`seq > cursor` 必然出现在事件里）。
+- **与实际供数一致**：事件与文件登记/日期限制变更在同一 SQLite 事务内提交，写盘或登记失败时
+  不会产生通知；`refetch` 只在该日确实可下载时发出。
+- **清除期间抑制**：日期受限期间提交的上传不产生 `refetch`；受理清除立即产生 `withdraw`。
+  该日**所有**清除任务完成后才产生一次 `refetch`（仍有文件）或 `delete`（已无文件）。
+  清除失败则保持 `withdraw`，不发后续通知。
+
 ## 数据布局
 
 ```
@@ -93,7 +126,7 @@ data/
   date=2026-11-01/
     part-<file_id>.parquet      # 每次上传追加一个 part 文件
 state/
-  erasure.db                    # SQLite：文件清单、任务、限制日期、用户-日期索引
+  erasure.db                    # SQLite：文件清单、任务、限制日期、用户-日期索引、变更事件流
 ```
 
 Parquet schema：`user_id: string, page: string, ts: timestamp[us, tz=UTC]`。

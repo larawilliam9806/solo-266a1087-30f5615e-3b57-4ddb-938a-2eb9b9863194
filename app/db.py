@@ -49,7 +49,31 @@ CREATE TABLE IF NOT EXISTS restricted_dates (
     task_id TEXT NOT NULL,
     PRIMARY KEY (date, task_id)
 );
+
+-- append-only feed of date changes consumed by downstream mirrors.
+-- AUTOINCREMENT guarantees a sequence number is never reused, so a cursor
+-- handed out before a restart keeps its meaning after it.
+CREATE TABLE IF NOT EXISTS change_events (
+    seq        INTEGER PRIMARY KEY AUTOINCREMENT,
+    date       TEXT NOT NULL,
+    action     TEXT NOT NULL CHECK (action IN ('refetch', 'withdraw', 'delete')),
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_change_events_seq ON change_events(seq);
 """
+
+
+def append_event(conn: sqlite3.Connection, date: str, action: str, now: str) -> None:
+    """Append one change event inside the caller's transaction.
+
+    Every event is written in the same transaction as the state change it
+    describes, so a change can never become visible without its notification
+    (nor a notification without the change).
+    """
+    conn.execute(
+        "INSERT INTO change_events(date, action, created_at) VALUES (?,?,?)",
+        (date, action, now),
+    )
 
 
 def utcnow() -> str:
@@ -103,6 +127,17 @@ class StateStore:
 
     def record_upload(self, file_id: str, date: str, path: str, rows: int,
                       user_ids: Iterable[str]) -> None:
+        """Register a new part file and, in the same transaction, notify the
+        change feed.
+
+        A ``refetch`` is emitted only when the date is downloadable at commit
+        time: while a date is restricted (an erasure covering it is running)
+        the upstream upload must not tell mirrors to pull, because the date is
+        not served and its content is still being rewritten. The erasure's
+        own finalize step emits the notification once every erasure touching
+        the date has completed. If this transaction fails, neither the file
+        record nor the event exists.
+        """
         now = utcnow()
         with self.transaction() as conn:
             conn.execute(
@@ -114,6 +149,14 @@ class StateStore:
                 "INSERT OR IGNORE INTO user_dates(user_id, date) VALUES (?,?)",
                 [(u, date) for u in user_ids],
             )
+            if not self._is_restricted_conn(conn, date):
+                append_event(conn, date, "refetch", now)
+
+    @staticmethod
+    def _is_restricted_conn(conn: sqlite3.Connection, date: str) -> bool:
+        return conn.execute(
+            "SELECT 1 FROM restricted_dates WHERE date=? LIMIT 1", (date,)
+        ).fetchone() is not None
 
     def get_file(self, file_id: str) -> Optional[sqlite3.Row]:
         return self.query_one("SELECT * FROM files WHERE file_id=?", (file_id,))
@@ -149,7 +192,15 @@ class StateStore:
     def accept_task(self, task_id: str, user_id: str) -> None:
         """Create the task, snapshot every active file that may hold the user's
         data and restrict the affected dates — atomically. Runs under the
-        service commit lock, so no upload can slip in between."""
+        service commit lock, so no upload can slip in between.
+
+        Every date that becomes restricted by this acceptance is withdrawn
+        from the change feed in the same transaction: from that instant the
+        date is neither downloadable nor mirrorable, and a failure of the
+        task keeps it withdrawn (no further event is written until the task
+        finishes). Dates that were already withdrawn by another erasure do
+        not produce a second event.
+        """
         now = utcnow()
         with self.transaction() as conn:
             conn.execute(
@@ -164,11 +215,24 @@ class StateStore:
                 "       (SELECT date FROM user_dates WHERE user_id=?)",
                 (task_id, user_id),
             )
+            newly_restricted = [
+                r[0]
+                for r in conn.execute(
+                    "SELECT DISTINCT ud.date FROM user_dates ud"
+                    " WHERE ud.user_id=?"
+                    "   AND NOT EXISTS (SELECT 1 FROM restricted_dates rd"
+                    "                    WHERE rd.date=ud.date)"
+                    " ORDER BY ud.date",
+                    (user_id,),
+                )
+            ]
             conn.execute(
                 "INSERT OR IGNORE INTO restricted_dates(date, task_id)"
                 " SELECT date, ? FROM user_dates WHERE user_id=?",
                 (task_id, user_id),
             )
+            for date in newly_restricted:
+                append_event(conn, date, "withdraw", now)
 
     def get_task(self, task_id: str) -> Optional[sqlite3.Row]:
         return self.query_one("SELECT * FROM erasure_tasks WHERE task_id=?", (task_id,))
@@ -297,13 +361,81 @@ class StateStore:
 
     def finalize_task(self, task_id: str, user_id: str) -> None:
         """Mark the task completed and lift this task's date restrictions.
-        The user stays blocked forever because the task row itself remains."""
+        The user stays blocked forever because the task row itself remains.
+
+        A date is only announced again once *every* erasure covering it is
+        complete: when this task's restriction is removed, dates that are
+        still restricted by another task stay withdrawn. For each date that
+        becomes downloadable again the feed emits ``refetch`` when the date
+        still has active files, or ``delete`` when nothing is left (the
+        mirror must drop its stale copy). All of this happens in one
+        transaction with the task completion, so the notification always
+        matches what ``/dates`` and the download endpoint will serve.
+        """
         now = utcnow()
         with self.transaction() as conn:
+            restricted = [
+                r[0]
+                for r in conn.execute(
+                    "SELECT date FROM restricted_dates WHERE task_id=? ORDER BY date",
+                    (task_id,),
+                )
+            ]
             conn.execute("DELETE FROM user_dates WHERE user_id=?", (user_id,))
             conn.execute("DELETE FROM restricted_dates WHERE task_id=?", (task_id,))
+            for date in restricted:
+                if self._is_restricted_conn(conn, date):
+                    continue  # another erasure still covers this date
+                has_files = conn.execute(
+                    "SELECT 1 FROM files WHERE date=? AND status='active' LIMIT 1",
+                    (date,),
+                ).fetchone() is not None
+                append_event(conn, date, "refetch" if has_files else "delete", now)
             conn.execute(
                 "UPDATE erasure_tasks SET status='completed', last_error=NULL, updated_at=?"
                 " WHERE task_id=?",
                 (now, task_id),
             )
+
+    # -------------------------------------------------------- change feed
+
+    def subscribe_snapshot(self) -> tuple[list[dict], int]:
+        """Initial subscribable state: the downloadable dates and the cursor
+        separating them from later events.
+
+        Read in one transaction (and by the caller under the commit lock), so
+        an upload or erasure commit cannot land between the date list and the
+        cursor. Any change after this snapshot has a ``seq`` greater than the
+        returned cursor and is therefore delivered by the feed.
+        """
+        with self.transaction() as conn:
+            rows = conn.execute(
+                "SELECT f.date AS date, COUNT(*) AS files, SUM(f.rows) AS rows"
+                " FROM files f"
+                " WHERE f.status='active'"
+                "   AND NOT EXISTS (SELECT 1 FROM restricted_dates rd"
+                "                   WHERE rd.date=f.date)"
+                " GROUP BY f.date ORDER BY f.date"
+            ).fetchall()
+            cursor = conn.execute(
+                "SELECT COALESCE(MAX(seq), 0) AS c FROM change_events"
+            ).fetchone()[0]
+            return [
+                {"date": r["date"], "files": r["files"], "rows": r["rows"]}
+                for r in rows
+            ], cursor
+
+    def changes_page(self, cursor: int, limit: int) -> tuple[list[dict], int]:
+        """Read one page of events after ``cursor`` plus the log head, in a
+        single transaction so the page and ``has_more`` agree."""
+        with self.transaction() as conn:
+            rows = conn.execute(
+                "SELECT seq, date, action, created_at FROM change_events"
+                " WHERE seq > ? ORDER BY seq LIMIT ?",
+                (cursor, limit),
+            ).fetchall()
+            latest = conn.execute(
+                "SELECT COALESCE(MAX(seq), 0) AS c FROM change_events"
+            ).fetchone()[0]
+        return [dict(r) for r in rows], latest
+

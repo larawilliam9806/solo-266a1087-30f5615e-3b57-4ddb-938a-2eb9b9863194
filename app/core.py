@@ -127,7 +127,15 @@ class ErasureService:
                     self.config.data_dir, date, filtered
                 )
                 users = set(filtered.column("user_id").to_pylist())
-                self.store.record_upload(file_id, date, rel_path, filtered.num_rows, users)
+                try:
+                    self.store.record_upload(
+                        file_id, date, rel_path, filtered.num_rows, users
+                    )
+                except Exception:
+                    # the file was written but never registered: remove it so
+                    # disk and state agree, and no event was emitted either
+                    storage.delete_file(self.config.data_dir, rel_path)
+                    raise
             return {
                 "blocked": blocked,
                 "stored": filtered.num_rows,
@@ -188,6 +196,38 @@ class ErasureService:
             "updated_at": task["updated_at"],
         }
 
+    # ------------------------------------------------------------ change feed
+
+    def subscribe(self) -> dict:
+        """First call of a downstream mirror: current downloadable dates plus
+        the cursor for everything that happens afterwards.
+
+        Taken under the commit lock so it cannot interleave with an upload or
+        erasure acceptance: every commit happens either entirely before the
+        snapshot (and is included in the date list) or entirely after it (and
+        gets a ``seq`` greater than the cursor). There is no gap.
+        """
+        with self.commit_lock:
+            dates, cursor = self.store.subscribe_snapshot()
+        return {"dates": dates, "cursor": cursor}
+
+    def changes(self, cursor: int, limit: int) -> dict:
+        """Claim up to ``limit`` fixed-numbered events after ``cursor``.
+
+        Events are append-only and their ``seq`` never changes, so a mirror
+        may persist the returned cursor and resume after a restart; events it
+        already applied can simply be re-applied (they describe the latest
+        state of a date).
+        """
+        events, latest = self.store.changes_page(cursor, limit)
+        next_cursor = events[-1]["seq"] if events else cursor
+        return {
+            "events": events,
+            "cursor": next_cursor,
+            "latest_cursor": latest,
+            "has_more": next_cursor < latest,
+        }
+
     # ---------------------------------------------------- worker operations
 
     def erase_file(self, task, file_id: str) -> None:
@@ -219,9 +259,15 @@ class ErasureService:
                 new_id, rel_path = storage.write_table_atomic(
                     self.config.data_dir, date, kept
                 )
-                self.store.record_rewrite(
-                    task["task_id"], file_id, new_id, date, rel_path, kept.num_rows
-                )
+                try:
+                    self.store.record_rewrite(
+                        task["task_id"], file_id, new_id, date, rel_path, kept.num_rows
+                    )
+                except Exception:
+                    # replacement written but not registered: drop it; the
+                    # task fails and the original file stays authoritative
+                    storage.delete_file(self.config.data_dir, rel_path)
+                    raise
             storage.delete_file(self.config.data_dir, info["path"])
             self.store.mark_file_deleted(file_id)
 

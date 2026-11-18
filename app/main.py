@@ -193,6 +193,28 @@ def create_app(config: Config | None = None) -> FastAPI:
             raise HTTPException(404, f"unknown task {task_id}")
         return status
 
+    # ------------------------------------------------------------- changes
+
+    @app.get("/changes", summary="Subscribe: current dates plus a change cursor")
+    def changes(
+        since: int | None = Query(
+            None, ge=0, description="Cursor from a previous /changes or feed call"
+        ),
+        limit: int = Query(100, ge=1, le=1000, description="Max events per page"),
+    ):
+        """One endpoint for both steps of the mirror protocol.
+
+        Without ``since`` it returns the current downloadable dates and a
+        cursor; with ``since`` it returns the fixed-numbered events that
+        follow that cursor. The cursor can be persisted and reused after a
+        restart, and the first call can be retried after a crash without
+        losing a notification (dates already listed are re-listed by the
+        next subscription, not by a stale cursor).
+        """
+        if since is None:
+            return service.subscribe()
+        return service.changes(since, limit)
+
     # --------------------------------------------------------------- misc
 
     @app.get("/health")

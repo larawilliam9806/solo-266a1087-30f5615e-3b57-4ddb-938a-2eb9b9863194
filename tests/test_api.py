@@ -469,3 +469,359 @@ def test_progress_endpoint_reports_counts(tmp_path):
         assert status["restricted_dates"] == []
         assert status["last_error"] is None
         assert client.get("/erasure/does-not-exist").status_code == 404
+
+
+# ------------------------------------------------------------ change feed
+
+
+def get_changes(client: TestClient, cursor: int | None = None, limit: int | None = None) -> dict:
+    params = {}
+    if cursor is not None:
+        params["since"] = cursor
+    if limit is not None:
+        params["limit"] = limit
+    r = client.get("/changes", params=params)
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+def page(client: TestClient, cursor: int, limit: int = 100) -> dict:
+    """Claim every event after ``cursor`` by paging like a real mirror."""
+    events = []
+    while True:
+        body = get_changes(client, cursor, limit)
+        events.extend(body["events"])
+        cursor = body["cursor"]
+        if not body["has_more"]:
+            return {"events": events, "cursor": cursor, "dates": None}
+
+
+def test_subscribe_lists_downloadable_dates_and_cursor(tmp_path):
+    with make_client(tmp_path) as client:
+        upload(client, "2026-11-01", [("alice", "/a", "2026-11-01T00:00:00Z")])
+        upload(client, "2026-11-02", [("bob", "/b", "2026-11-02T00:00:00Z")])
+
+        body = get_changes(client)
+        assert body["dates"] == [
+            {"date": "2026-11-01", "files": 1, "rows": 1},
+            {"date": "2026-11-02", "files": 1, "rows": 1},
+        ]
+        assert isinstance(body["cursor"], int)
+
+        # nothing happened since the snapshot
+        assert get_changes(client, body["cursor"])["events"] == []
+
+
+def test_upload_emits_refetch_and_cursor_pages_are_fixed(tmp_path):
+    with make_client(tmp_path) as client:
+        cursor = get_changes(client)["cursor"]
+        upload(client, "2026-11-01", [("alice", "/a", "2026-11-01T00:00:00Z")])
+        upload(client, "2026-11-01", [("bob", "/b", "2026-11-01T00:01:00Z")])
+        upload(client, "2026-11-02", [("carol", "/c", "2026-11-02T00:00:00Z")])
+
+        first = get_changes(client, cursor, limit=1)
+        assert len(first["events"]) == 1
+        assert first["events"][0]["action"] == "refetch"
+        assert first["events"][0]["date"] == "2026-11-01"
+        assert first["has_more"] is True
+
+        rest = page(client, first["cursor"], limit=1)
+        assert [(e["date"], e["action"]) for e in rest["events"]] == [
+            ("2026-11-01", "refetch"),
+            ("2026-11-02", "refetch"),
+        ]
+
+        # sequence numbers are fixed and strictly increasing; re-reading the
+        # same cursor yields the same events
+        seqs = [e["seq"] for e in [first["events"][0], *rest["events"]]]
+        assert seqs == sorted(seqs) and len(set(seqs)) == len(seqs)
+        again = page(client, first["cursor"], limit=1)
+        assert again["events"] == rest["events"]
+
+        # the mirror's cursor resumes after a restart of the service
+        assert page(client, rest["cursor"])["events"] == []
+
+
+def test_erasure_immediately_withdraws_then_refetches_after_completion(tmp_path):
+    with make_client(tmp_path) as client:
+        upload(
+            client,
+            "2026-11-01",
+            [("alice", "/a", "2026-11-01T00:00:00Z"), ("bob", "/b", "2026-11-01T00:01:00Z")],
+        )
+        upload(client, "2026-11-02", [("carol", "/c", "2026-11-02T00:00:00Z")])
+        cursor = page(client, get_changes(client)["cursor"])["cursor"]
+
+        service = client.app.state.service
+        gate = threading.Event()
+        original_erase = service.erase_file
+
+        def slow_erase(task, file_id):
+            gate.wait(10)
+            return original_erase(task, file_id)
+
+        service.erase_file = slow_erase
+        try:
+            r = client.post("/erasure", json={"user_id": "alice"})
+            task_id = r.json()["task_id"]
+
+            # the withdrawal is visible at acceptance time, before the worker runs
+            now = page(client, cursor)
+            assert [(e["date"], e["action"]) for e in now["events"]] == [
+                ("2026-11-01", "withdraw")
+            ]
+            cursor = now["cursor"]
+            # the date is no longer offered for subscription while restricted
+            assert get_changes(client)["dates"] == [
+                {"date": "2026-11-02", "files": 1, "rows": 1}
+            ]
+        finally:
+            gate.set()
+            service.erase_file = original_erase
+
+        wait_task(client, task_id)
+        after = page(client, cursor)
+        assert [(e["date"], e["action"]) for e in after["events"]] == [
+            ("2026-11-01", "refetch")
+        ]
+        assert download_users(client, "2026-11-01") == {"bob"}
+
+
+def test_date_with_only_erased_rows_emits_delete(tmp_path):
+    with make_client(tmp_path) as client:
+        upload(client, "2026-11-01", [("alice", "/a", "2026-11-01T00:00:00Z")])
+        cursor = page(client, get_changes(client)["cursor"])["cursor"]
+
+        task_id = client.post("/erasure", json={"user_id": "alice"}).json()["task_id"]
+        wait_task(client, task_id)
+
+        events = page(client, cursor)["events"]
+        assert [(e["date"], e["action"]) for e in events] == [
+            ("2026-11-01", "withdraw"),
+            ("2026-11-01", "delete"),
+        ]
+        # nothing left to download, so the mirror correctly drops its copy
+        assert client.get("/dates/2026-11-01/download").status_code == 404
+        assert get_changes(client)["dates"] == []
+
+
+def test_uploads_during_erasure_do_not_emit_refetch(tmp_path):
+    with make_client(tmp_path) as client:
+        upload(
+            client,
+            "2026-11-01",
+            [("alice", "/a", "2026-11-01T00:00:00Z"), ("bob", "/b", "2026-11-01T00:01:00Z")],
+        )
+        cursor = page(client, get_changes(client)["cursor"])["cursor"]
+
+        service = client.app.state.service
+        gate = threading.Event()
+        original_erase = service.erase_file
+
+        def slow_erase(task, file_id):
+            gate.wait(10)
+            return original_erase(task, file_id)
+
+        service.erase_file = slow_erase
+        try:
+            task_id = client.post("/erasure", json={"user_id": "alice"}).json()["task_id"]
+            # an upload that commits while the date is restricted must not tell
+            # the mirror to pull (the date is not downloadable and is changing)
+            r = upload(client, "2026-11-01", [("dave", "/d", "2026-11-01T02:00:00Z")])
+            assert r.json()["stored"] == 1
+        finally:
+            gate.set()
+            service.erase_file = original_erase
+
+        wait_task(client, task_id)
+        events = page(client, cursor)["events"]
+        assert [(e["date"], e["action"]) for e in events] == [
+            ("2026-11-01", "withdraw"),
+            ("2026-11-01", "refetch"),
+        ]
+        # the refetch reflects the final downloadable content
+        assert download_users(client, "2026-11-01") == {"bob", "dave"}
+
+
+def test_failed_erasure_stays_withdrawn_until_it_completes(tmp_path, monkeypatch):
+    config = make_config(tmp_path)
+    app1 = create_app(config)
+    with TestClient(app1) as client:
+        upload(
+            client,
+            "2026-11-01",
+            [("alice", "/a", "2026-11-01T00:00:00Z"), ("bob", "/b", "2026-11-01T00:01:00Z")],
+        )
+        cursor = page(client, get_changes(client)["cursor"])["cursor"]
+
+        def always_fail(*args, **kwargs):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(storage, "write_table_atomic", always_fail)
+        task_id = client.post("/erasure", json={"user_id": "alice"}).json()["task_id"]
+        wait_status(client, task_id, "failed")
+
+        # still no download and no re-fetch notification
+        assert client.get("/dates/2026-11-01/download").status_code == 409
+        assert [e["action"] for e in page(client, cursor)["events"]] == ["withdraw"]
+
+    monkeypatch.undo()
+    app2 = create_app(config)
+    with TestClient(app2) as client2:
+        wait_task(client2, task_id)
+        events = page(client2, cursor)["events"]
+        assert [(e["date"], e["action"]) for e in events] == [
+            ("2026-11-01", "withdraw"),
+            ("2026-11-01", "refetch"),
+        ]
+
+
+def test_overlapping_erasures_emit_one_refetch_after_all_complete(tmp_path):
+    with make_client(tmp_path) as client:
+        upload(
+            client,
+            "2026-11-01",
+            [
+                ("alice", "/a", "2026-11-01T00:00:00Z"),
+                ("bob", "/b", "2026-11-01T00:01:00Z"),
+                ("carol", "/c", "2026-11-01T00:02:00Z"),
+            ],
+        )
+        cursor = page(client, get_changes(client)["cursor"])["cursor"]
+
+        service = client.app.state.service
+        gate = threading.Event()
+        original_erase = service.erase_file
+
+        def slow_erase(task, file_id):
+            gate.wait(10)
+            return original_erase(task, file_id)
+
+        service.erase_file = slow_erase
+        try:
+            t1 = client.post("/erasure", json={"user_id": "alice"}).json()["task_id"]
+            t2 = client.post("/erasure", json={"user_id": "bob"}).json()["task_id"]
+            # one withdraw for the date, not two
+            assert [e["action"] for e in page(client, cursor)["events"]] == ["withdraw"]
+        finally:
+            gate.set()
+            service.erase_file = original_erase
+
+        wait_task(client, t1)
+        wait_task(client, t2)
+        events = page(client, cursor)["events"]
+        actions = [e["action"] for e in events]
+        # exactly one refetch, and only after both erasures completed
+        assert actions.count("withdraw") == 1
+        assert actions.count("refetch") == 1
+        assert actions[-1] == "refetch"
+        assert download_users(client, "2026-11-01") == {"carol"}
+
+
+def test_first_fetch_interleaved_with_commits_has_no_gap(tmp_path):
+    """A subscription racing uploads/erasures never loses a date.
+
+    Every commit that the subscriber did not see in its initial snapshot must
+    appear as an event after the returned cursor (and vice versa), otherwise
+    the mirror would miss a date entirely.
+    """
+    with make_client(tmp_path) as client:
+        upload(client, "2026-10-31", [("seed", "/s", "2026-10-31T00:00:00Z")])
+
+        bodies: list[dict] = []
+        stop = threading.Event()
+
+        def subscriber():
+            cursor = None
+            while not stop.is_set():
+                if cursor is None:
+                    body = get_changes(client)
+                    seen = {d["date"] for d in body["dates"]}
+                    bodies.append({"dates": seen, "cursor": body["cursor"]})
+                    cursor = body["cursor"]
+                else:
+                    body = get_changes(client, cursor)
+                    if body["events"]:
+                        bodies.append({"dates": set(), "events": body["events"]})
+                    cursor = body["cursor"]
+
+        t = threading.Thread(target=subscriber)
+        t.start()
+        try:
+            for i in range(30):
+                date = f"2026-11-{i + 1:02d}"
+                assert upload(
+                    client, date, [(f"u{i}", "/p", f"{date}T00:00:00Z")]
+                ).status_code == 200
+                if i % 10 == 9:
+                    r = client.post("/erasure", json={"user_id": f"u{i}"})
+                    wait_task(client, r.json()["task_id"])
+            # give the subscriber a last poll
+            time.sleep(0.2)
+        finally:
+            stop.set()
+            t.join(10)
+
+        announced = set()
+        for batch in bodies:
+            announced |= batch["dates"]
+            for event in batch.get("events", []):
+                announced.add(event["date"])
+
+        # every date ever committed was announced to the subscriber
+        for i in range(30):
+            assert f"2026-11-{i + 1:02d}" in announced
+
+
+def test_cursor_survives_a_restart(tmp_path):
+    config = make_config(tmp_path)
+    app1 = create_app(config)
+    with TestClient(app1) as client:
+        upload(client, "2026-11-01", [("alice", "/a", "2026-11-01T00:00:00Z")])
+        cursor = page(client, get_changes(client)["cursor"])["cursor"]
+
+    app2 = create_app(config)
+    with TestClient(app2) as client2:
+        upload(client2, "2026-11-02", [("bob", "/b", "2026-11-02T00:00:00Z")])
+        events = page(client2, cursor)["events"]
+        # only the new upload appears; earlier events are not renumbered or replayed
+        assert [(e["date"], e["action"]) for e in events] == [
+            ("2026-11-02", "refetch")
+        ]
+        # and the numbering continues after the restart
+        assert events[0]["seq"] > cursor
+
+
+
+def test_failed_write_emits_no_notification(tmp_path, monkeypatch):
+    with make_client(tmp_path) as client:
+        cursor = get_changes(client)["cursor"]
+
+        def always_fail(*args, **kwargs):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(storage, "write_table_atomic", always_fail)
+        with pytest.raises(OSError, match="disk full"):
+            upload(client, "2026-11-01", [("alice", "/a", "2026-11-01T00:00:00Z")])
+
+        assert page(client, cursor)["events"] == []
+        assert get_changes(client)["dates"] == []
+
+
+def test_registration_failure_emits_no_notification_and_leaves_no_file(tmp_path, monkeypatch):
+    with make_client(tmp_path) as client:
+        service = client.app.state.service
+        cursor = get_changes(client)["cursor"]
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("state database unavailable")
+
+        monkeypatch.setattr(service.store, "record_upload", boom)
+        with pytest.raises(RuntimeError, match="state database unavailable"):
+            upload(client, "2026-11-01", [("alice", "/a", "2026-11-01T00:00:00Z")])
+
+        # nothing was announced, nothing is downloadable, no orphan file remains
+        assert page(client, cursor)["events"] == []
+        assert get_changes(client)["dates"] == []
+        assert client.get("/dates/2026-11-01/download").status_code == 404
+        assert not list((tmp_path / "data").rglob("part-*.parquet"))
